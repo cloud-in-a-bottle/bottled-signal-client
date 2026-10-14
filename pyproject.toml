@@ -14,6 +14,8 @@ dependencies = [
     "protobuf>=7.36.2",
     "cryptography>=49.0.0",
     "litestar-tus>=1.3.0",
+    # litestar-tus imports its S3 backend (and so botocore) unconditionally, though S3 is an optional extra.
+    "botocore>=1.43.34",
 ]
 
 [dependency-groups]
