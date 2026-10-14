@@ -11,9 +11,12 @@ port = 8080
 health_check = "/health"
 
 [resources]
-# signal-cli's native binary maps ~250MB of (reclaimable) file-backed pages on top of its heap; backup imports
-# decrypt and decompress in a streaming fashion but still need headroom.
-memory_mb = 1024
+# Measured under a 320MB limit: ~50MB anonymous memory idle and while importing/exporting an 80MB backup (both
+# stream), plus ~175MB of signal-cli's mapped native binary that should stay resident. The rest is headroom for a
+# live account, which hasn't been measured yet.
+memory_mb = 512
+# A clean image build fits in 512MB; give it room anyway.
+build_memory_mb = 1024
 cpu_cores = 1
 
 [data]
