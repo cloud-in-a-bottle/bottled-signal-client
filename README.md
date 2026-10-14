@@ -2,7 +2,7 @@
 
 A Signal messenger client as an OpenHost app. [signal-cli](https://github.com/AsamK/signal-cli) runs inside the
 container as the **primary device** for a phone number; a web chat UI sits on top, and your phone can be linked to it as
-a secondary device. Message history from a phone's on-device backup can be imported.
+a secondary device. Message history from a phone's on-device backup can be imported, and exported back as one.
 
 ## using it
 
@@ -57,7 +57,9 @@ media is removed once viewed, and edits keep their history.
 
 ## limitations
 
-- No message-history transfer to linked devices (see above).
+- No message-history transfer to linked devices: a phone linked to this server starts with an empty history. (Signal's
+  "link and sync" needs signal-cli to send a key while linking, which it doesn't support.) The only way to get the
+  history onto a phone is *Move history to a phone*, which makes the phone the primary again.
 - Legacy Android `.backup` files (30-digit passphrase) aren't imported; use an on-device backup instead.
 - Cloud (Signal-hosted) backups can't be imported; they need Signal's servers to decrypt.
 - Not yet handled: stickers sent live (shown as "[sticker]"), polls (shown as text), payments, stories, calls (no
