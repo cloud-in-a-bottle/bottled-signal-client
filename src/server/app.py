@@ -29,6 +29,7 @@ from server.routes.chats import ChatsController
 from server.routes.events import events
 from server.routes.exports import ExportsController
 from server.routes.imports import ImportsController
+from server.routes.storage import storage
 from server.signal.account_file import AccountSecretsUnavailable
 from server.signal.daemon import SignalDaemon
 from server.signal.receiver import Receiver
@@ -126,6 +127,7 @@ app = Litestar(
         health,
         index,
         events,
+        storage,
         AccountController,
         ChatsController,
         ImportsController,

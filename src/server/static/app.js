@@ -1,5 +1,6 @@
 import { openExportFlow } from "/static/export.js";
 import { openImportFlow } from "/static/import.js";
+import { openStorage } from "/static/storage.js";
 
 const app = document.getElementById("app");
 const PAGE_SIZE = 50;
@@ -159,6 +160,7 @@ function renderMain() {
   app.replaceChildren(template("tpl-main"));
   app.querySelector('[data-action="settings"]').addEventListener("click", openSettings);
   app.querySelector('[data-action="new-chat"]').addEventListener("click", openNewChat);
+  app.querySelector('[data-action="storage"]').addEventListener("click", () => openStorage(api));
   const search = app.querySelector("#search");
   let searchTimer;
   search.addEventListener("input", () => {

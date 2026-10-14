@@ -51,6 +51,7 @@
         <header class="bar">
           <strong class="title">Chats</strong>
           <button class="icon" data-action="new-chat" title="New chat" aria-label="New chat">✎</button>
+          <button class="icon" data-action="storage" title="Storage" aria-label="Storage">▤</button>
           <button class="icon" data-action="settings" title="Settings" aria-label="Settings">⚙</button>
         </header>
         <div class="search"><input type="search" id="search" placeholder="Search messages"></div>
@@ -157,6 +158,16 @@
             <div id="export-status"></div>
           </section>
         </div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-storage">
+    <div class="modal-backdrop">
+      <div class="modal storage">
+        <header class="bar"><strong class="title">Storage</strong>
+          <button class="icon" data-action="close" aria-label="Close">✕</button></header>
+        <div class="modal-body" id="storage-body"><p class="hint">Measuring…</p></div>
       </div>
     </div>
   </template>
