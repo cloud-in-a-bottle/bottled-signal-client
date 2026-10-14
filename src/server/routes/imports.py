@@ -1,52 +1,36 @@
 import attr
 from litestar import Controller
-from litestar import Request
-from litestar import delete
 from litestar import get
 from litestar import post
-from litestar import put
-from litestar.datastructures import State
 
 from server.context import AppContext
 from server.imports.manager import ImportStatus
-from server.imports.manager import UploadSession
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class SpaceCheckRequest:
+    total_bytes: int
 
 
 @attr.s(auto_attribs=True, frozen=True)
 class StartImportRequest:
+    upload_id: str
     passphrase: str
 
 
-@attr.s(auto_attribs=True, frozen=True)
-class CreateImportRequest:
-    total_bytes: int
-
-
 class ImportsController(Controller):
+    """The zip itself arrives through the tus endpoint at /api/uploads (see app.py); these start and track imports."""
+
     path = "/api/imports"
 
-    @post("/")
-    async def create(self, ctx: AppContext, data: CreateImportRequest) -> ImportStatus:
-        return ctx.imports.create(data.total_bytes)
+    @post("/check-space")
+    async def check_space(self, ctx: AppContext, data: SpaceCheckRequest) -> None:
+        ctx.imports.check_disk_space(data.total_bytes)
 
-    @get("/resumable")
-    async def resumable(self, ctx: AppContext) -> list[UploadSession]:
-        return ctx.imports.resumable()
+    @post("/")
+    async def start(self, ctx: AppContext, data: StartImportRequest) -> ImportStatus:
+        return await ctx.imports.start(data.upload_id, data.passphrase)
 
     @get("/{import_id:str}")
     async def status(self, ctx: AppContext, import_id: str) -> ImportStatus:
         return ctx.imports.status(import_id)
-
-    @put("/{import_id:str}/chunk")
-    async def chunk(
-        self, ctx: AppContext, request: Request[object, object, State], import_id: str, path: str, offset: int
-    ) -> None:
-        ctx.imports.write_chunk(import_id, path, offset, await request.body())
-
-    @post("/{import_id:str}/start")
-    async def start(self, ctx: AppContext, import_id: str, data: StartImportRequest) -> ImportStatus:
-        return ctx.imports.start(import_id, data.passphrase)
-
-    @delete("/{import_id:str}")
-    async def cancel(self, ctx: AppContext, import_id: str) -> None:
-        ctx.imports.cancel(import_id)

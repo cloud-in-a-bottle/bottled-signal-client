@@ -16,9 +16,8 @@ a secondary device. Message history from a phone's on-device backup can be impor
    *Linked devices*, scan it with a camera, upload a screenshot, or paste the `sgnl://linkdevice?…` link. The phone gets
    contacts and groups, and everything from then on; it does **not** get past message history (signal-cli doesn't
    implement Signal's "link and sync" transfer).
-4. **Import history.** On the phone, make an on-device backup (Settings › Chats › Backups), copy the `SignalBackups`
-   folder to the computer you're browsing from, and in settings › *Import history* choose that folder and enter the
-   64-character recovery key. Importing is idempotent: messages are keyed by (author, sent timestamp), so re-importing
+4. **Import history.** On the phone, make an on-device backup (Settings › Chats › Backups), zip the `SignalBackups`
+   folder, and in settings › *Import history* upload the zip with the 64-character recovery key. Importing is idempotent: messages are keyed by (author, sent timestamp), so re-importing
    or overlapping with live messages doesn't duplicate anything.
 
 5. **Move history to a phone (optional).** Settings › *Move history to a phone* builds an on-device backup of
@@ -44,8 +43,11 @@ a secondary device. Message history from a phone's on-device backup can be impor
 - `src/server/backup/exporter.py` writes the reverse: our database as a local backup a phone can restore. It needs the
   account's recovery key (Account Entropy Pool) and profile key, and group master keys, which signal-cli keeps in its
   own storage but doesn't expose over JSON-RPC; `src/server/signal/account_file.py` reads them from there.
-- `src/server/imports/` — backup uploads. The browser sends the folder in 8MB chunks, because the OpenHost router
-  buffers each request body in memory; the import then runs in a thread, and the uploaded files are deleted afterwards.
+- `src/server/imports/` — backup imports. The zip arrives over [tus](https://tus.io) (resumable uploads:
+  [tus-js-client](https://github.com/tus/tus-js-client), vendored in `static/vendor/`, and the `litestar-tus` plugin at
+  `/api/uploads`) in 8MB chunks, because the OpenHost router buffers each request body in memory. The import reads the
+  backup straight out of the zip in a thread, and the zip is deleted afterwards (kept if only the recovery key was
+  wrong, so it can be retried).
 - `src/server/static/` — the UI: plain JS modules, no build step. Live updates arrive over SSE (`/api/events`).
 
 Data: signal-cli's keys and state are in `$OPENHOST_APP_DATA_DIR/signal-cli` (losing them means re-registering), the

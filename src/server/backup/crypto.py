@@ -10,7 +10,9 @@ import zlib
 from collections.abc import Callable
 from collections.abc import Iterator
 from pathlib import Path
+from typing import IO
 
+import attr
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher
@@ -26,6 +28,24 @@ class BackupDecryptError(Exception):
     pass
 
 
+class WrongRecoveryKey(BackupDecryptError):
+    """The key is malformed or doesn't decrypt this backup; the same upload can be retried with another key."""
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class EncryptedFile:
+    """A file to decrypt, either on disk or inside an uploaded zip: its name (for errors), size, and a way to open it
+    for a sequential read."""
+
+    name: str
+    size: int
+    open: Callable[[], IO[bytes]]
+
+    @staticmethod
+    def from_path(path: Path) -> "EncryptedFile":
+        return EncryptedFile(name=path.name, size=path.stat().st_size, open=lambda: path.open("rb"))
+
+
 def _hkdf(ikm: bytes, info: bytes, length: int) -> bytes:
     return HKDF(hashes.SHA256(), length, None, info).derive(ikm)
 
@@ -33,7 +53,7 @@ def _hkdf(ikm: bytes, info: bytes, length: int) -> bytes:
 def normalize_recovery_key(text: str) -> str:
     key = "".join(text.split()).replace("-", "").lower()
     if len(key) != 64 or not key.isalnum():
-        raise BackupDecryptError("the recovery key should be 64 letters and digits")
+        raise WrongRecoveryKey("the recovery key should be 64 letters and digits")
     return key
 
 
@@ -60,12 +80,12 @@ def message_backup_keys(bk: bytes, backup_id: bytes) -> tuple[bytes, bytes]:
     return k[:32], k[32:]
 
 
-def _verify_hmac(path: Path, key: bytes) -> None:
-    size = path.stat().st_size
+def _verify_hmac(source: EncryptedFile, key: bytes) -> None:
+    size = source.size
     if size < 16 + 16 + 32:
-        raise BackupDecryptError(f"{path.name} is too short to be a backup")
+        raise BackupDecryptError(f"{source.name} is too short to be a backup")
     mac = hmac.new(key, digestmod=hashlib.sha256)
-    with path.open("rb") as f:
+    with source.open() as f:
         remaining = size - 32
         while remaining:
             chunk = f.read(min(_CHUNK, remaining))
@@ -73,15 +93,15 @@ def _verify_hmac(path: Path, key: bytes) -> None:
             remaining -= len(chunk)
         expected = f.read(32)
     if not hmac.compare_digest(mac.digest(), expected):
-        raise BackupDecryptError("the recovery key doesn't match this backup")
+        raise BackupDecryptError(f"{source.name} is corrupt or doesn't match its key")
 
 
 def _decrypt_cbc_stream(
-    path: Path, aes_key: bytes, on_progress: Callable[[float], None] | None = None
+    source: EncryptedFile, aes_key: bytes, on_progress: Callable[[float], None] | None = None
 ) -> Iterator[bytes]:
     """Yield the PKCS7-unpadded plaintext of `IV(16) ‖ AES-256-CBC ciphertext ‖ HMAC(32)`, streaming."""
-    size = path.stat().st_size
-    with path.open("rb") as f:
+    size = source.size
+    with source.open() as f:
         iv = f.read(16)
         decryptor = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).decryptor()
         unpadder = padding.PKCS7(128).unpadder()
@@ -96,15 +116,18 @@ def _decrypt_cbc_stream(
 
 
 def decrypt_main(
-    path: Path, hmac_key: bytes, aes_key: bytes, on_progress: Callable[[float], None] | None = None
+    source: EncryptedFile, hmac_key: bytes, aes_key: bytes, on_progress: Callable[[float], None] | None = None
 ) -> Iterator[bytes]:
     """Verify then stream-decrypt and gunzip a backup's `main` file, yielding decompressed chunks."""
-    with path.open("rb") as f:
+    with source.open() as f:
         if f.read(len(_REMOTE_BACKUP_MAGIC)) == _REMOTE_BACKUP_MAGIC:
             raise BackupDecryptError("this is a Signal-hosted (cloud) backup, not an on-device backup")
-    _verify_hmac(path, hmac_key)
+    try:
+        _verify_hmac(source, hmac_key)
+    except BackupDecryptError as e:
+        raise WrongRecoveryKey("the recovery key doesn't match this backup") from e
     inflater = zlib.decompressobj(wbits=31)
-    for chunk in _decrypt_cbc_stream(path, aes_key, on_progress):
+    for chunk in _decrypt_cbc_stream(source, aes_key, on_progress):
         yield inflater.decompress(chunk)
     yield inflater.flush()
 
@@ -143,15 +166,15 @@ def local_media_name(plaintext_hash: bytes, local_key: bytes) -> str:
     return hashlib.sha256(plaintext_hash + local_key).hexdigest()
 
 
-def decrypt_attachment(path: Path, local_key: bytes, size: int, plaintext_hash: bytes) -> Iterator[bytes]:
+def decrypt_attachment(source: EncryptedFile, local_key: bytes, size: int, plaintext_hash: bytes) -> Iterator[bytes]:
     """Stream-decrypt a local-backup attachment. `local_key` is AES(32) ‖ HMAC(32), the reverse of the main file."""
     if len(local_key) != 64:
         raise BackupDecryptError("attachment key has the wrong length")
     aes_key, mac_key = local_key[:32], local_key[32:]
-    _verify_hmac(path, mac_key)
+    _verify_hmac(source, mac_key)
     digest = hashlib.sha256()
     remaining = size
-    for chunk in _decrypt_cbc_stream(path, aes_key):
+    for chunk in _decrypt_cbc_stream(source, aes_key):
         # The plaintext is padded with zeros beyond `size`.
         chunk = chunk[:remaining]
         remaining -= len(chunk)

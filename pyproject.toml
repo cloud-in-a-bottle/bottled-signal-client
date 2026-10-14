@@ -2,7 +2,7 @@
 name = "bottled-signal-client"
 version = "0.1.0"
 description = "A Signal messenger client: signal-cli as the primary device, with a web chat UI and backup import"
-requires-python = "==3.12.*"
+requires-python = "==3.13.*"
 dependencies = [
     "litestar>=2.12",
     "hypercorn>=0.17",
@@ -13,6 +13,7 @@ dependencies = [
     "pillow>=12.3.0",
     "protobuf>=7.36.2",
     "cryptography>=49.0.0",
+    "litestar-tus>=1.3.0",
 ]
 
 [dependency-groups]
@@ -71,7 +72,7 @@ known-first-party = [
 ]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.13"
 mypy_path = ["src"]
 packages = ["server"]
 strict = true

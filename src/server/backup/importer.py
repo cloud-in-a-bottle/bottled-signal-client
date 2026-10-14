@@ -3,9 +3,13 @@ import json
 import sqlite3
 import time
 import uuid
+import zipfile
 from collections.abc import Callable
 from collections.abc import Iterable
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from pathlib import PurePosixPath
 
 import attr
 from loguru import logger
@@ -32,8 +36,28 @@ class ImportResult:
 
 @attr.s(auto_attribs=True, frozen=True)
 class LocalBackup:
-    snapshot_dir: Path
-    files_dir: Path | None
+    """A local backup inside an uploaded zip. `snapshot` and `files_prefix` are member-name prefixes ending in "/" (or
+    empty for the zip's root)."""
+
+    archive: zipfile.ZipFile
+    names: dict[str, zipfile.ZipInfo]
+    snapshot: str
+    files_prefix: str | None
+
+    def member(self, name: str) -> crypto.EncryptedFile | None:
+        info = self.names.get(name)
+        if info is None:
+            return None
+        return crypto.EncryptedFile(name=name, size=info.file_size, open=lambda: self.archive.open(info))
+
+    def attachment(self, media_name: str) -> crypto.EncryptedFile | None:
+        if self.files_prefix is None:
+            return None
+        for candidate in (media_name, media_name.upper()):
+            found = self.member(f"{self.files_prefix}{candidate[:2]}/{candidate}")
+            if found is not None:
+                return found
+        return None
 
 
 def _uuid_str(raw: bytes) -> str:
@@ -50,10 +74,10 @@ def _join_name(*parts: str) -> str | None:
 
 
 class _Importer:
-    def __init__(self, conn: sqlite3.Connection, files: FileStore, files_dir: Path | None, progress: ProgressFn):
+    def __init__(self, conn: sqlite3.Connection, files: FileStore, backup: LocalBackup, progress: ProgressFn):
         self._conn = conn
         self._files = files
-        self._files_dir = files_dir
+        self._backup = backup
         self._progress = progress
         self._recipients: dict[int, int] = {}  # backup recipient id -> our recipient id
         self._chats: dict[int, int] = {}  # backup chat id -> our conversation's recipient id
@@ -390,21 +414,17 @@ class _Importer:
         """Decrypt a local-backup attachment into the file store, returning its sha256, or None if not present."""
         loc = pointer.locatorInfo
         if (
-            self._files_dir is None
-            or not pointer.HasField("locatorInfo")
+            not pointer.HasField("locatorInfo")
             or not loc.HasField("localKey")
             or loc.WhichOneof("integrityCheck") != "plaintextHash"
         ):
             return None
         name = crypto.local_media_name(loc.plaintextHash, loc.localKey)
-        path = self._files_dir / name[:2] / name
-        if not path.exists():
-            upper = self._files_dir / name[:2].upper() / name.upper()
-            if not upper.exists():
-                return None
-            path = upper
+        source = self._backup.attachment(name)
+        if source is None:
+            return None
         try:
-            return self._files.put_stream(crypto.decrypt_attachment(path, loc.localKey, loc.size, loc.plaintextHash))
+            return self._files.put_stream(crypto.decrypt_attachment(source, loc.localKey, loc.size, loc.plaintextHash))
         except crypto.BackupDecryptError as e:
             logger.warning("skipping attachment {}: {}", name, e)
             return None
@@ -437,33 +457,48 @@ class _Importer:
         return text
 
 
-def find_local_backup(root: Path) -> LocalBackup:
-    """Locate the newest complete snapshot (a dir holding `main` + `metadata`) and the shared `files/` dir in an
-    uploaded tree. Accepts the SignalBackups folder, a single snapshot folder, or a snapshot plus files."""
-    snapshots = sorted(
-        (
-            p.parent
-            for p in root.rglob("metadata")
-            if (p.parent / "main").is_file() and not p.parent.name.endswith("-tmp")
-        ),
-        key=lambda p: p.name,
-    )
-    if not snapshots:
-        if any(p.suffix == ".backup" for p in root.rglob("*.backup")):
-            raise crypto.BackupDecryptError(
-                "this looks like a legacy Android .backup file, which isn't supported yet; export an on-device backup "
-                "(Settings › Chats › Backups) instead"
-            )
-        raise crypto.BackupDecryptError(
-            "couldn't find a backup (a folder containing 'main' and 'metadata') in the upload"
+@contextmanager
+def open_local_backup(zip_path: Path) -> Iterator[LocalBackup]:
+    """Open an uploaded zip of a local backup: the `SignalBackups` folder, or a single snapshot folder with or without
+    the shared `files/` folder. The newest complete snapshot (a folder holding `main` and `metadata`) is used."""
+    try:
+        archive = zipfile.ZipFile(zip_path)
+    except zipfile.BadZipFile as e:
+        raise crypto.BackupDecryptError("the upload isn't a valid zip file") from e
+    with archive:
+        names = {
+            info.filename: info
+            for info in archive.infolist()
+            if not info.is_dir() and not info.filename.startswith("__MACOSX/")
+        }
+        snapshots = sorted(
+            (
+                name[: -len("metadata")]
+                for name in names
+                if name.endswith("metadata")
+                and (name == "metadata" or name.endswith("/metadata"))
+                and name[: -len("metadata")] + "main" in names
+                and not name[: -len("metadata")].rstrip("/").endswith("-tmp")
+            ),
+            key=lambda prefix: PurePosixPath(prefix).name,
         )
-    snapshot = snapshots[-1]
-    files_dir = None
-    for candidate in (snapshot.parent / "files", snapshot / "files", root / "files"):
-        if candidate.is_dir():
-            files_dir = candidate
-            break
-    return LocalBackup(snapshot_dir=snapshot, files_dir=files_dir)
+        if not snapshots:
+            if any(name.endswith(".backup") for name in names):
+                raise crypto.BackupDecryptError(
+                    "this looks like a legacy Android .backup file, which isn't supported; export an on-device "
+                    "backup (Settings › Chats › Backups) instead"
+                )
+            raise crypto.BackupDecryptError(
+                "couldn't find a backup (a folder containing 'main' and 'metadata') in the zip"
+            )
+        snapshot = snapshots[-1]
+        parent = str(PurePosixPath(snapshot).parent) + "/" if "/" in snapshot.rstrip("/") else ""
+        files_prefix = None
+        for candidate in (parent + "files/", snapshot + "files/", "files/"):
+            if any(name.startswith(candidate) for name in names):
+                files_prefix = candidate
+                break
+        yield LocalBackup(archive=archive, names=names, snapshot=snapshot, files_prefix=files_prefix)
 
 
 def import_local_backup(
@@ -473,17 +508,21 @@ def import_local_backup(
     files: FileStore,
     progress: ProgressFn,
 ) -> ImportResult:
+    metadata_file = backup.member(backup.snapshot + "metadata")
+    main_file = backup.member(backup.snapshot + "main")
+    assert metadata_file is not None and main_file is not None
     metadata = LocalBackup_pb2.Metadata()
-    metadata.ParseFromString((backup.snapshot_dir / "metadata").read_bytes())
+    with metadata_file.open() as f:
+        metadata.ParseFromString(f.read())
     if metadata.version != 1:
         raise crypto.BackupDecryptError(f"unsupported backup metadata version {metadata.version}")
     bk = crypto.backup_key(crypto.normalize_recovery_key(recovery_key))
     backup_id = crypto.backup_id_from_metadata(bk, metadata.backupId.iv, metadata.backupId.encryptedId)
     hmac_key, aes_key = crypto.message_backup_keys(bk, backup_id)
 
-    importer = _Importer(conn, files, backup.files_dir, progress)
+    importer = _Importer(conn, files, backup, progress)
     importer.report("Checking recovery key")
-    chunks = crypto.decrypt_main(backup.snapshot_dir / "main", hmac_key, aes_key, importer.set_fraction)
+    chunks = crypto.decrypt_main(main_file, hmac_key, aes_key, importer.set_fraction)
     frames = crypto.read_frames(chunks)
     info = pb.BackupInfo()
     info.ParseFromString(next(frames))

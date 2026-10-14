@@ -1,64 +1,61 @@
 import asyncio
-import errno
 import json
 import os
+import re
 import shutil
 import sqlite3
 import threading
 import time
-import uuid
 from pathlib import Path
-from pathlib import PurePosixPath
 
 import attr
+from litestar_tus import FileStorageBackend
 from loguru import logger
 
+from server.backup.crypto import WrongRecoveryKey
+from server.backup.importer import import_local_backup
+from server.backup.importer import open_local_backup
 from server.db.connection import connect
 from server.db.files import FileStore
 from server.events import EventBroker
 from server.events import UiEvent
-from server.imports.run import run_import
 
 
 @attr.s(auto_attribs=True, frozen=True)
 class ImportStatus:
     id: str
-    state: str  # uploading | importing | done | failed
+    state: str  # importing | done | failed
     message: str
     messages_imported: int
     messages_skipped: int
     attachments_imported: int
     progress: float
+    # Set when the import failed only because of the recovery key: the upload is kept so it can be retried.
+    retry_with_new_key: bool = False
 
 
-@attr.s(auto_attribs=True, frozen=True)
-class UploadSession:
-    """An upload that hasn't been started yet, with how much of each file has arrived, so the browser can resume it."""
-
-    id: str
-    received: dict[str, int]
-    updated_at: int
-
-
-# Sessions left over from an upload that was never finished are cleaned up after this long.
-_ABANDONED_AFTER_S = 7 * 24 * 3600
 # Free space kept back so an import doesn't fill the disk to the last byte.
 _DISK_MARGIN_BYTES = 256 * 1024 * 1024
+# Uploads that were never imported (abandoned in the browser) are removed after this long.
+_STALE_UPLOAD_S = 24 * 3600
+_UPLOAD_ID = re.compile(r"[0-9a-f]{32}")
 
 
 class ImportManager:
-    """Owns backup upload sessions and runs the import in a background thread.
-
-    Uploads arrive as many small chunks (the OpenHost router buffers each request body in memory, so a multi-GB backup
-    can't be one request). A session holds one or more files under relative paths, so a whole backup folder can be
-    uploaded. Sessions live on disk and are picked up again after a restart, so an interrupted upload can be resumed.
-    """
+    """Imports backup zips that arrived through the tus upload endpoint, one background thread per import. The uploaded
+    zip is deleted once the import has finished, successfully or not: it holds the whole message history."""
 
     def __init__(
-        self, root: Path, conn: sqlite3.Connection, files: FileStore, files_root: Path, broker: EventBroker
+        self,
+        uploads: FileStorageBackend,
+        conn: sqlite3.Connection,
+        files: FileStore,
+        files_root: Path,
+        broker: EventBroker,
     ) -> None:
-        self._root = root / "imports"
-        self._root.mkdir(parents=True, exist_ok=True)
+        self._uploads = uploads
+        self._upload_dir = Path(uploads.upload_dir)
+        self._upload_dir.mkdir(parents=True, exist_ok=True)
         self._db_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
         self._files = files
         self._files_root = files_root
@@ -66,45 +63,22 @@ class ImportManager:
         self._statuses: dict[str, ImportStatus] = {}
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._adopt_leftover_sessions()
+        self._remove_stale_uploads()
 
-    def _adopt_leftover_sessions(self) -> None:
+    def _remove_stale_uploads(self) -> None:
         now = time.time()
-        for session_dir in self._root.iterdir():
-            if not session_dir.is_dir():
-                continue
-            if now - session_dir.stat().st_mtime > _ABANDONED_AFTER_S or not (session_dir / "files").is_dir():
-                logger.info("removing abandoned upload {}", session_dir.name)
-                shutil.rmtree(session_dir, ignore_errors=True)
-                continue
-            logger.info("found interrupted upload {}; it can be resumed", session_dir.name)
-            self._statuses[session_dir.name] = self._new_status(session_dir.name, "Upload interrupted")
+        for path in self._upload_dir.iterdir():
+            if now - path.stat().st_mtime > _STALE_UPLOAD_S:
+                logger.info("removing abandoned upload file {}", path.name)
+                path.unlink(missing_ok=True)
 
-    @staticmethod
-    def _new_status(session_id: str, message: str) -> ImportStatus:
-        return ImportStatus(
-            id=session_id,
-            state="uploading",
-            message=message,
-            messages_imported=0,
-            messages_skipped=0,
-            attachments_imported=0,
-            progress=0.0,
-        )
-
-    def create(self, total_bytes: int) -> ImportStatus:
-        self._check_disk_space(total_bytes)
-        session_id = uuid.uuid4().hex
-        (self._root / session_id / "files").mkdir(parents=True)
-        return self._set(self._new_status(session_id, "Uploading"))
-
-    def _check_disk_space(self, upload_bytes: int) -> None:
-        """The upload is stored once, and importing writes the decrypted attachments again: up to twice its size."""
-        upload_dev = os.stat(self._root).st_dev
+    def check_disk_space(self, upload_bytes: int) -> None:
+        """The zip is stored once, and importing writes the decrypted attachments again: up to twice its size."""
+        upload_dev = os.stat(self._upload_dir).st_dev
         files_dev = os.stat(self._files_root).st_dev
         needs: dict[int, int] = {upload_dev: upload_bytes}
         needs[files_dev] = needs.get(files_dev, 0) + upload_bytes
-        paths = {upload_dev: self._root, files_dev: self._files_root}
+        paths = {upload_dev: self._upload_dir, files_dev: self._files_root}
         for dev, needed in needs.items():
             free = shutil.disk_usage(paths[dev]).free
             if free < needed + _DISK_MARGIN_BYTES:
@@ -113,91 +87,49 @@ class ImportManager:
                     f"but the server has {free / 2**30:.1f} GB"
                 )
 
-    def resumable(self) -> list[UploadSession]:
+    def status(self, import_id: str) -> ImportStatus:
         with self._lock:
-            ids = [s.id for s in self._statuses.values() if s.state == "uploading"]
-        sessions = []
-        for session_id in ids:
-            files_dir = self._root / session_id / "files"
-            if not files_dir.is_dir():
-                continue
-            received = {
-                p.relative_to(files_dir).as_posix(): p.stat().st_size for p in files_dir.rglob("*") if p.is_file()
-            }
-            sessions.append(
-                UploadSession(id=session_id, received=received, updated_at=int(files_dir.stat().st_mtime * 1000))
-            )
-        return sorted(sessions, key=lambda s: s.updated_at, reverse=True)
-
-    def status(self, session_id: str) -> ImportStatus:
-        with self._lock:
-            status = self._statuses.get(session_id)
+            status = self._statuses.get(import_id)
         if status is None:
-            raise ValueError(f"no import {session_id}")
+            raise ValueError(f"no import {import_id}")
         return status
 
-    def _session_path(self, session_id: str, relative_path: str) -> Path:
-        status = self.status(session_id)
-        if status.state != "uploading":
-            raise ValueError("this import is no longer accepting uploads")
-        parts = PurePosixPath(relative_path).parts
-        if (
-            not parts
-            or any(p in ("", ".", "..") or "/" in p or "\\" in p for p in parts)
-            or relative_path.startswith("/")
-        ):
-            raise ValueError(f"bad upload path {relative_path!r}")
-        return self._root / session_id / "files" / Path(*parts)
-
-    def write_chunk(self, session_id: str, relative_path: str, offset: int, data: bytes) -> None:
-        path = self._session_path(session_id, relative_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        size = path.stat().st_size if path.exists() else 0
-        if offset > size:
-            logger.warning(
-                "upload {}: chunk for {} at {} but only {} bytes received", session_id, relative_path, offset, size
-            )
-            raise ValueError(f"chunk for {relative_path} at offset {offset}, but only {size} bytes have arrived")
-        if offset + len(data) <= size:
-            return  # a retry of a chunk that was already written
+    async def start(self, upload_id: str, passphrase: str) -> ImportStatus:
+        if not _UPLOAD_ID.fullmatch(upload_id):
+            raise ValueError("bad upload id")
         try:
-            with path.open("r+b" if path.exists() else "wb") as f:
-                # A retry after a partly-written chunk overwrites it; chunks of the same file are identical.
-                f.truncate(offset)
-                f.seek(offset)
-                f.write(data)
-        except OSError as e:
-            logger.warning("upload {}: writing {} failed: {}", session_id, relative_path, e)
-            if e.errno == errno.ENOSPC:
-                raise ValueError("the server ran out of disk space") from e
-            raise
-
-    def start(self, session_id: str, passphrase: str) -> ImportStatus:
-        status = self.status(session_id)
-        if status.state != "uploading":
-            raise ValueError("import already started")
+            info = await (await self._uploads.get_upload(upload_id)).get_info()
+        except FileNotFoundError as e:
+            raise ValueError("that upload doesn't exist (it may have expired); upload the zip again") from e
+        if info.size is None or info.offset != info.size:
+            raise ValueError("that upload hasn't finished")
+        with self._lock:
+            previous = self._statuses.get(upload_id)
+        if previous is not None and previous.state == "importing":
+            raise ValueError("that upload is already being imported")
         self._loop = asyncio.get_running_loop()
-        status = self._set(attr.evolve(status, state="importing", message="Starting import"))
-        thread = threading.Thread(target=self._run, args=(session_id, passphrase), daemon=True)
-        thread.start()
+        status = self._set(
+            ImportStatus(
+                id=upload_id,
+                state="importing",
+                message="Starting import",
+                messages_imported=0,
+                messages_skipped=0,
+                attachments_imported=0,
+                progress=0.0,
+            )
+        )
+        threading.Thread(target=self._run, args=(upload_id, passphrase), daemon=True).start()
         return status
 
-    def cancel(self, session_id: str) -> None:
-        status = self.status(session_id)
-        if status.state == "importing":
-            raise ValueError("can't cancel an import that is running")
-        shutil.rmtree(self._root / session_id, ignore_errors=True)
-        with self._lock:
-            del self._statuses[session_id]
-
-    def _run(self, session_id: str, passphrase: str) -> None:
+    def _run(self, upload_id: str, passphrase: str) -> None:
         conn = connect(self._db_path)
         try:
 
             def report(message: str, progress: float, imported: int, skipped: int, attachments: int) -> None:
                 self._set(
                     attr.evolve(
-                        self.status(session_id),
+                        self.status(upload_id),
                         message=message,
                         progress=progress,
                         messages_imported=imported,
@@ -206,10 +138,11 @@ class ImportManager:
                     )
                 )
 
-            result = run_import(self._root / session_id / "files", passphrase, conn, self._files, report)
+            with open_local_backup(self._upload_dir / upload_id) as backup:
+                result = import_local_backup(backup, passphrase, conn, self._files, report)
             self._set(
                 attr.evolve(
-                    self.status(session_id),
+                    self.status(upload_id),
                     state="done",
                     message="Import finished",
                     progress=1.0,
@@ -218,14 +151,18 @@ class ImportManager:
                     attachments_imported=result.attachments_imported,
                 )
             )
-        except Exception as e:
-            logger.exception("backup import {} failed", session_id)
-            self._set(attr.evolve(self.status(session_id), state="failed", message=str(e) or type(e).__name__))
-        finally:
+        except WrongRecoveryKey as e:
+            # Nothing was imported; keep the upload so a corrected key doesn't mean uploading it all again.
+            self._set(attr.evolve(self.status(upload_id), state="failed", message=str(e), retry_with_new_key=True))
             conn.close()
-            # The uploaded backup holds the whole message history; don't keep it around once imported.
-            shutil.rmtree(self._root / session_id / "files", ignore_errors=True)
-            self._publish(UiEvent(kind="conversations", data="{}"))
+            return
+        except Exception as e:
+            logger.exception("backup import {} failed", upload_id)
+            self._set(attr.evolve(self.status(upload_id), state="failed", message=str(e) or type(e).__name__))
+        conn.close()
+        for suffix in ("", ".info", ".lock"):
+            (self._upload_dir / f"{upload_id}{suffix}").unlink(missing_ok=True)
+        self._publish(UiEvent(kind="conversations", data="{}"))
 
     def _set(self, status: ImportStatus) -> ImportStatus:
         with self._lock:

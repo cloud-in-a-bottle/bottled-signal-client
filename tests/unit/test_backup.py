@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import time
 import uuid
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -12,8 +13,8 @@ from backup_writer import BackupWriter
 from server.backup import crypto
 from server.backup.exporter import export_local_backup
 from server.backup.importer import ImportResult
-from server.backup.importer import find_local_backup
 from server.backup.importer import import_local_backup
+from server.backup.importer import open_local_backup
 from server.backup.proto import backup_pb2 as pb
 from server.db import recipients as dbr
 from server.db.connection import connect
@@ -139,8 +140,20 @@ def _write_backup(tmp_path: Path) -> tuple[Path, BackupWriter]:
     return tmp_path / "upload", w
 
 
-def _import(upload: Path, conn: sqlite3.Connection, files: FileStore) -> ImportResult:
-    return import_local_backup(find_local_backup(upload), RECOVERY_KEY, conn, files, lambda *_: None)
+def _zip(folder: Path) -> Path:
+    """Zip a folder the way a user would before uploading it: the folder itself at the top of the archive."""
+    zip_path = folder.with_suffix(".zip")
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for path in sorted(folder.rglob("*")):
+            zf.write(path, path.relative_to(folder.parent).as_posix())
+    return zip_path
+
+
+def _import(
+    upload: Path, conn: sqlite3.Connection, files: FileStore, recovery_key: str = RECOVERY_KEY
+) -> ImportResult:
+    with open_local_backup(_zip(upload)) as backup:
+        return import_local_backup(backup, recovery_key, conn, files, lambda *_: None)
 
 
 def test_import_local_backup(tmp_path: Path, conn: sqlite3.Connection, files: FileStore) -> None:
@@ -215,13 +228,40 @@ def test_reimport_is_idempotent(tmp_path: Path, conn: sqlite3.Connection, files:
 def test_wrong_recovery_key_is_rejected(tmp_path: Path, conn: sqlite3.Connection, files: FileStore) -> None:
     upload, _ = _write_backup(tmp_path)
     with pytest.raises(crypto.BackupDecryptError, match="recovery key doesn't match"):
-        import_local_backup(find_local_backup(upload), "a" * 64, conn, files, lambda *_: None)
+        _import(upload, conn, files, recovery_key="a" * 64)
 
 
 def test_legacy_backup_gets_a_clear_error(tmp_path: Path) -> None:
-    (tmp_path / "signal-2026-01-01-00-00-00.backup").write_bytes(b"x")
-    with pytest.raises(crypto.BackupDecryptError, match="legacy Android"):
-        find_local_backup(tmp_path)
+    (tmp_path / "upload").mkdir()
+    (tmp_path / "upload" / "signal-2026-01-01-00-00-00.backup").write_bytes(b"x")
+    with (
+        pytest.raises(crypto.BackupDecryptError, match="legacy Android"),
+        open_local_backup(_zip(tmp_path / "upload")),
+    ):
+        pass
+
+
+def test_not_a_zip_gets_a_clear_error(tmp_path: Path) -> None:
+    (tmp_path / "upload.zip").write_bytes(b"not a zip")
+    with (
+        pytest.raises(crypto.BackupDecryptError, match="isn't a valid zip"),
+        open_local_backup(tmp_path / "upload.zip"),
+    ):
+        pass
+
+
+def test_finds_backup_zipped_at_any_level(tmp_path: Path, conn: sqlite3.Connection, files: FileStore) -> None:
+    """Users may zip the SignalBackups folder, its contents, or just the snapshot folder plus files/."""
+    upload, writer = _write_backup(tmp_path)
+    contents = tmp_path / "contents.zip"
+    with zipfile.ZipFile(contents, "w") as zf:
+        for path in sorted(writer.root.rglob("*")):
+            zf.write(path, path.relative_to(writer.root).as_posix())
+        zf.writestr("__MACOSX/._junk", b"")
+    with open_local_backup(contents) as backup:
+        assert backup.snapshot == "signal-backup-2026-10-01-12-00-00/"
+        assert backup.files_prefix == "files/"
+        assert import_local_backup(backup, RECOVERY_KEY, conn, files, lambda *_: None).attachments_imported == 1
 
 
 def _snapshot(conn: sqlite3.Connection, files: FileStore) -> dict[str, object]:

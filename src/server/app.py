@@ -12,6 +12,9 @@ from litestar import get
 from litestar.datastructures import State
 from litestar.di import Provide
 from litestar.static_files import create_static_files_router
+from litestar_tus import FileStorageBackend
+from litestar_tus import TUSConfig
+from litestar_tus import TUSPlugin
 from loguru import logger
 
 from server.background import expire_messages_forever
@@ -80,10 +83,25 @@ def handle_client_error(
     return Response(ErrorBody(detail=str(exc)), status_code=400)
 
 
+# Loaded at import time because the upload endpoint (a plugin) needs its directory when the app is built.
+_config = load_config()
+# Backup zips are uploaded with the tus resumable-upload protocol, in chunks small enough for the OpenHost router,
+# which buffers each request body in memory.
+_uploads = FileStorageBackend(_config.uploads_dir / "tus")
+_tus = TUSPlugin(
+    TUSConfig(
+        storage_backend=_uploads,
+        path_prefix="/api/uploads",
+        max_size=64 * 2**30,
+        expiration_seconds=24 * 3600,
+    )
+)
+
+
 @asynccontextmanager
 async def lifespan(_: Litestar) -> AsyncIterator[None]:
     global _context
-    config = load_config()
+    config = _config
     conn = connect(config.db_path)
     init_schema(conn)
     files = FileStore(config.attachments_dir)
@@ -99,7 +117,7 @@ async def lifespan(_: Litestar) -> AsyncIterator[None]:
     stream = EventStream(daemon.base_url, receiver.handle)
 
     signal = SignalService(conn, rpc, stream, files, broker, config.signal_config_dir, config.signal_cli_bin)
-    imports = ImportManager(config.uploads_dir, conn, files, config.attachments_dir, broker)
+    imports = ImportManager(_uploads, conn, files, config.attachments_dir, broker)
     exports = ExportManager(config.temp_dir, config.db_path, files, broker)
     _context = AppContext(
         config=config, conn=conn, files=files, broker=broker, signal=signal, imports=imports, exports=exports
@@ -141,5 +159,6 @@ app = Litestar(
         AccountSecretsUnavailable: handle_client_error,
     },
     lifespan=[lifespan],
+    plugins=[_tus],
     request_max_body_size=200 * 1024 * 1024,
 )

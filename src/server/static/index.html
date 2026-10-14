@@ -132,13 +132,12 @@
           </section>
           <section>
             <h3>Import history from a backup</h3>
-            <p class="hint">Choose the <code>SignalBackups</code> folder from your phone's on-device backup
-              (Settings › Chats › Backups on iPhone or Android), and enter its 64-character recovery key. Messages
-              already here are not duplicated, so importing again later is safe.</p>
-            <p class="hint">If your backup is a <code>.zip</code> file, unzip it first and choose the
-              <code>SignalBackups</code> folder inside.</p>
+            <p class="hint">Make an on-device backup on your phone (Settings › Chats › Backups), zip its
+              <code>SignalBackups</code> folder (on iPhone: long-press it in Files › Compress), and upload the zip with
+              the backup's 64-character recovery key. Messages already here are not duplicated, so importing again later
+              is safe.</p>
             <div class="link-options">
-              <label class="button">Choose backup folder<input type="file" id="import-folder" webkitdirectory hidden></label>
+              <label class="button">Choose backup .zip<input type="file" id="import-file" accept=".zip,application/zip" hidden></label>
             </div>
             <form id="import-form" hidden>
               <p data-field="import-selection"></p>
@@ -189,6 +188,7 @@
     </div>
   </template>
 
+  <script src="/static/vendor/tus.min.js"></script>
   <script src="/static/app.js" type="module"></script>
 </body>
 </html>

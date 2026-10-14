@@ -1,3 +1,5 @@
+// Backup zips are uploaded with tus (resumable uploads; window.tus is tus-js-client from /static/vendor). Chunks stay
+// small because the OpenHost router buffers each request body in memory.
 const CHUNK = 8 * 1024 * 1024;
 
 function formatSize(n) {
@@ -7,30 +9,56 @@ function formatSize(n) {
   return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
 }
 
+// tus-js-client retries failed requests but has no timeout, so a request that stalls (a dropped connection, a laptop
+// waking from sleep) would wait forever. If nothing moves for this long, abort and restart; tus asks the server how
+// much it already has and continues from there.
+const STALL_MS = 60_000;
+
+function upload(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    let lastActivity = Date.now();
+    let watchdog = null;
+    const finish = (fn) => (value) => { clearInterval(watchdog); fn(value); };
+    const up = new window.tus.Upload(file, {
+      endpoint: "/api/uploads",
+      chunkSize: CHUNK,
+      // Keep retrying through network drops for several minutes before giving up.
+      retryDelays: [0, 1000, 3000, 5000, 10_000, 20_000, 30_000, 30_000, 30_000, 30_000, 30_000],
+      metadata: { filename: file.name, filetype: file.type || "application/zip" },
+      // Lets a retried upload of the same file in this browser continue where it stopped.
+      storeFingerprintForResuming: true,
+      removeFingerprintOnSuccess: true,
+      onProgress: (sent, total) => { lastActivity = Date.now(); onProgress(sent, total); },
+      onError: finish(reject),
+      onSuccess: finish(() => resolve(up.url.split("/").pop())),
+    });
+    watchdog = setInterval(() => {
+      if (Date.now() - lastActivity < STALL_MS) return;
+      lastActivity = Date.now();
+      up.abort().then(() => up.start());
+    }, 5000);
+    up.findPreviousUploads().then((previous) => {
+      if (previous.length) up.resumeFromPreviousUpload(previous[0]);
+      up.start();
+    }, finish(reject));
+  });
+}
+
 // Wire the "import history" section of the settings modal.
 export function openImportFlow(root, api) {
   const form = root.querySelector("#import-form");
   const statusBox = root.querySelector("#import-status");
-  let selected = [];
+  let selected = null;
+  // An uploaded zip whose import failed only on the recovery key; retrying with a corrected key reuses it.
+  let retryUploadId = null;
 
-  const select = (files) => {
-    // Keep the layout below the chosen folder (dropping the folder's own name) and skip hidden files.
-    let entries = [...files].map((f) => ({ file: f, path: f.webkitRelativePath.split("/").slice(1).join("/") }))
-      .filter((x) => x.path && !x.path.split("/").some((p) => p.startsWith(".")));
-    // The phone keeps a couple of snapshots side by side; only the newest complete one is needed.
-    const snapshots = [...new Set(entries.map((x) => x.path.split("/")[0]))]
-      .filter((d) => d.startsWith("signal-backup-") && !d.endsWith("-tmp")).sort();
-    if (snapshots.length > 1) {
-      const keep = snapshots[snapshots.length - 1];
-      entries = entries.filter((x) => { const top = x.path.split("/")[0]; return !snapshots.includes(top) || top === keep; });
-    }
-    selected = entries;
-    const total = selected.reduce((n, x) => n + x.file.size, 0);
+  root.querySelector("#import-file").addEventListener("change", (e) => {
+    selected = e.target.files[0] || null;
+    retryUploadId = null;
     form.querySelector('[data-field="import-selection"]').textContent =
-      `${selected.length} file${selected.length === 1 ? "" : "s"}, ${formatSize(total)}`;
-    form.hidden = !selected.length;
-  };
-  root.querySelector("#import-folder").addEventListener("change", (e) => select(e.target.files, true));
+      selected ? `${selected.name}, ${formatSize(selected.size)}` : "";
+    form.hidden = !selected;
+  });
 
   const showStatus = (s) => {
     const pct = Math.round(s.progress * 100);
@@ -40,17 +68,28 @@ export function openImportFlow(root, api) {
       ? `Done: ${s.messages_imported} messages imported, ${s.messages_skipped} already present, ${s.attachments_imported} attachments.`
       : s.state === "failed" ? `Import failed: ${s.message}` : `${s.message} (${pct}%)`;
     if (s.state === "failed") p.className = "error";
-    const bar = document.createElement("div");
-    bar.className = "progress";
-    bar.innerHTML = "<div></div>";
-    bar.firstChild.style.width = `${pct}%`;
     statusBox.append(p);
-    if (s.state === "importing" || s.state === "uploading") statusBox.append(bar);
+    if (s.state === "importing" || s.state === "uploading") {
+      const bar = document.createElement("div");
+      bar.className = "progress";
+      bar.innerHTML = "<div></div>";
+      bar.firstChild.style.width = `${pct}%`;
+      statusBox.append(bar);
+    }
   };
 
   let activeId = null;
+  let sawProgress = false;
   document.addEventListener("import-progress", (e) => {
-    if (e.detail.id === activeId && root.isConnected) showStatus(e.detail);
+    if (e.detail.id !== activeId || !root.isConnected) return;
+    sawProgress = true;
+    if (e.detail.retry_with_new_key) {
+      retryUploadId = e.detail.id;
+      form.hidden = false;
+      showStatus({ ...e.detail, message: `${e.detail.message}. Correct the key and press the button again; the zip won't need uploading again.` });
+      return;
+    }
+    showStatus(e.detail);
   });
 
   form.addEventListener("submit", async (e) => {
@@ -59,70 +98,28 @@ export function openImportFlow(root, api) {
     const button = form.querySelector("button");
     button.disabled = true;
     try {
-      const total = selected.reduce((n, x) => n + x.file.size, 0);
-      // Pick up an interrupted upload of the same folder: one whose files are all part of this selection and no
-      // larger than the local copies.
-      const sizes = new Map(selected.map((x) => [x.path, x.file.size]));
-      const previous = (await api("GET", "/api/imports/resumable")).find((s) => {
-        const got = Object.entries(s.received);
-        return got.length > 0 && got.every(([path, size]) => sizes.has(path) && size <= sizes.get(path));
-      });
-      const received = previous ? previous.received : {};
-      const session = previous || await api("POST", "/api/imports/", { total_bytes: total });
-      activeId = session.id;
-      let sent = selected.reduce((n, x) => n + Math.min(received[x.path] || 0, x.file.size), 0);
-      const label = previous ? "Resuming upload" : "Uploading";
-      for (const { file, path } of selected) {
-        const done = received[path] || 0;
-        if (done >= file.size && file.size > 0) continue;
-        // Resume from the last whole chunk boundary; the server overwrites a partly-written chunk.
-        for (let offset = done - (done % CHUNK); offset < file.size || (offset === 0 && file.size === 0); offset += CHUNK) {
-          const chunk = file.slice(offset, offset + CHUNK);
-          await putChunk(`/api/imports/${session.id}/chunk?path=${encodeURIComponent(path)}&offset=${offset}`, chunk);
-          sent += Math.max(0, offset + chunk.size - Math.max(offset, done));
-          showStatus({ state: "uploading", message: `${label}: ${formatSize(sent)} of ${formatSize(total)}`, progress: total ? sent / total : 1 });
-          if (file.size === 0) break;
-        }
+      let uploadId = retryUploadId;
+      retryUploadId = null;
+      if (!uploadId) {
+        showStatus({ state: "uploading", message: "Checking free space", progress: 0 });
+        await api("POST", "/api/imports/check-space", { total_bytes: selected.size });
+        showStatus({ state: "uploading", message: "Starting upload", progress: 0 });
+        uploadId = await upload(selected, (sent, total) => {
+          showStatus({ state: "uploading", message: `Uploading ${formatSize(sent)} of ${formatSize(total)}`, progress: total ? sent / total : 0 });
+        });
       }
-      showStatus(await api("POST", `/api/imports/${session.id}/start`, { passphrase }));
+      activeId = uploadId;
+      sawProgress = false;
       form.hidden = true;
+      const started = await api("POST", "/api/imports/", { upload_id: uploadId, passphrase });
+      // Progress events can overtake this response (eg a wrong key fails fast); don't overwrite them.
+      if (!sawProgress) showStatus(started);
     } catch (err) {
-      showStatus({
-        state: "failed",
-        message: `${err.message}. Choose the same folder and press Upload again to resume where it stopped.`,
-        progress: 0,
-      });
+      form.hidden = false;
+      const message = err.originalResponse ? `upload failed (${err.originalResponse.getStatus()})` : err.message;
+      showStatus({ state: "failed", message: `${message}. Press Upload again to continue where it stopped.`, progress: 0 });
     } finally {
       button.disabled = false;
     }
   });
-}
-
-// Upload one chunk, giving up on a stalled request after CHUNK_TIMEOUT_MS and retrying with backoff for a few
-// minutes, so a dropped connection or a laptop waking from sleep doesn't hang or kill the upload.
-const CHUNK_TIMEOUT_MS = 120_000;
-const RETRY_DELAYS_MS = [1000, 2000, 5000, 10_000, 20_000, 30_000, 30_000, 30_000, 30_000, 30_000];
-
-async function putChunk(url, chunk) {
-  for (let attempt = 0; ; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), CHUNK_TIMEOUT_MS);
-    try {
-      const res = await fetch(url, { method: "PUT", body: chunk, signal: controller.signal });
-      if (res.ok) return;
-      const text = await res.text();
-      let detail = text;
-      try { detail = JSON.parse(text).detail || text; } catch {}
-      // A rejected chunk (4xx) won't succeed on retry; anything else might.
-      if (res.status >= 400 && res.status < 500) throw Object.assign(new Error(detail), { permanent: true });
-      throw new Error(`server error ${res.status}`);
-    } catch (err) {
-      if (err.permanent || attempt >= RETRY_DELAYS_MS.length) {
-        throw err.name === "AbortError" ? new Error("the upload stalled") : err;
-      }
-      await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
-    } finally {
-      clearTimeout(timer);
-    }
-  }
 }
