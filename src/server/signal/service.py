@@ -30,6 +30,7 @@ from server.signal.receiver import mark_read_up_to
 from server.signal.rpc import JsonObject
 from server.signal.rpc import JsonValue
 from server.signal.rpc import SignalRpc
+from server.signal.rpc import SignalRpcError
 from server.signal.sse import EventStream
 
 _ACCOUNT_KEY = "account_number"
@@ -71,8 +72,10 @@ class SignalService:
         files: FileStore,
         broker: EventBroker,
         signal_data_dir: Path,
+        signal_cli_bin: Path,
     ) -> None:
         self._signal_data_dir = signal_data_dir
+        self._signal_cli_bin = signal_cli_bin
         self._conn = conn
         self._rpc = rpc
         self._stream = stream
@@ -101,10 +104,26 @@ class SignalService:
     # --- registration -------------------------------------------------------------------------------------------
 
     async def register(self, number: str, captcha: str | None, voice: bool) -> None:
-        params: JsonObject = {"account": number, "voice": voice}
+        # Uses the CLI rather than JSON-RPC: signal-cli 0.14.9's native build lacks reflection metadata for the
+        # JSON-RPC `register` params (RegisterCommand$RegistrationParams gained fields the metadata doesn't list), so
+        # the daemon rejects it. The CLI path parses arguments without that record. The pending registration is
+        # stored in the account file, which the daemon's `verify` loads from disk.
+        args = [str(self._signal_cli_bin), "--data-dir", str(self._signal_data_dir), "-a", number, "register"]
+        if voice:
+            args.append("--voice")
         if captcha:
-            params["captcha"] = captcha.strip()
-        await self._rpc.call("register", params)
+            args += ["--captcha", captcha.strip()]
+        process = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            output = (stderr or stdout).decode(errors="replace").strip()
+            logger.warning("signal-cli register failed ({}): {}", process.returncode, output)
+            # The last line is the user-facing error; earlier lines are log noise.
+            raise SignalRpcError(
+                process.returncode or -1, output.splitlines()[-1] if output else "registration failed"
+            )
         with transaction(self._conn):
             kv.put(self._conn, _PENDING_KEY, number)
 
