@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Bottled Signal</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div id="app" class="loading">Loading…</div>
+
+  <template id="tpl-setup">
+    <main class="setup">
+      <h1>Bottled Signal</h1>
+      <section data-step="register">
+        <h2>Register a number</h2>
+        <p class="hint">This server becomes the <strong>primary</strong> Signal device for the number. Any phone
+          currently registered as primary for it will be signed out; you can link it back afterwards as a
+          secondary device.</p>
+        <form id="register-form">
+          <label>Phone number (international format)
+            <input name="number" type="tel" placeholder="+15551234567" required autocomplete="tel"></label>
+          <label>Captcha
+            <textarea name="captcha" rows="3" placeholder="signalcaptcha://signal-hcaptcha…" required></textarea></label>
+          <p class="hint">Solve the captcha at
+            <a href="https://signalcaptchas.org/registration/generate.html" target="_blank" rel="noopener">signalcaptchas.org</a>,
+            then right-click <em>Open Signal</em>, copy the link, and paste it here.</p>
+          <label class="check"><input name="voice" type="checkbox"> Call me with the code instead of SMS
+            (only works after an SMS attempt)</label>
+          <button type="submit">Send verification code</button>
+        </form>
+      </section>
+      <section data-step="verify" hidden>
+        <h2>Enter verification code</h2>
+        <p class="hint">Sent to <strong data-field="pending"></strong>.</p>
+        <form id="verify-form">
+          <label>Code <input name="code" inputmode="numeric" autocomplete="one-time-code" required></label>
+          <label>Signal PIN (only if the number has registration lock)
+            <input name="pin" type="password" autocomplete="off"></label>
+          <button type="submit">Verify</button>
+          <button type="button" class="link" data-action="restart">Use a different number</button>
+        </form>
+      </section>
+      <p class="error" id="setup-error" hidden></p>
+    </main>
+  </template>
+
+  <template id="tpl-main">
+    <div class="shell">
+      <aside class="sidebar">
+        <header class="bar">
+          <strong class="title">Chats</strong>
+          <button class="icon" data-action="new-chat" title="New chat" aria-label="New chat">✎</button>
+          <button class="icon" data-action="settings" title="Settings" aria-label="Settings">⚙</button>
+        </header>
+        <div class="search"><input type="search" id="search" placeholder="Search messages"></div>
+        <ul class="conversations" id="conversations"></ul>
+        <ul class="search-results" id="search-results" hidden></ul>
+      </aside>
+      <section class="thread" id="thread">
+        <div class="empty">Select a conversation</div>
+      </section>
+    </div>
+  </template>
+
+  <template id="tpl-thread">
+    <header class="bar">
+      <button class="icon back" data-action="back" aria-label="Back">‹</button>
+      <div class="thread-title">
+        <strong data-field="name"></strong>
+        <small data-field="subtitle"></small>
+      </div>
+    </header>
+    <div class="messages" id="messages">
+      <button class="load-more" data-action="load-more" hidden>Load earlier messages</button>
+      <ol id="message-list"></ol>
+    </div>
+    <div class="typing" id="typing" hidden></div>
+    <form class="composer" id="composer">
+      <div class="reply-bar" id="reply-bar" hidden>
+        <div><small>Replying to <span data-field="reply-author"></span></small>
+          <div data-field="reply-text"></div></div>
+        <button type="button" class="icon" data-action="cancel-reply" aria-label="Cancel reply">✕</button>
+      </div>
+      <div class="pending-files" id="pending-files" hidden></div>
+      <div class="row">
+        <label class="icon attach" title="Attach files" aria-label="Attach files">📎
+          <input type="file" id="file-input" multiple hidden></label>
+        <textarea id="composer-input" rows="1" placeholder="Message"></textarea>
+        <button type="submit" class="send" aria-label="Send">➤</button>
+      </div>
+    </form>
+  </template>
+
+  <template id="tpl-settings">
+    <div class="modal-backdrop">
+      <div class="modal settings">
+        <header class="bar"><strong class="title">Settings</strong>
+          <button class="icon" data-action="close" aria-label="Close">✕</button></header>
+        <div class="modal-body">
+          <section>
+            <h3>Account</h3>
+            <p>Registered as <strong data-field="number"></strong></p>
+            <form id="profile-form" class="inline">
+              <input name="given_name" placeholder="First name" required>
+              <input name="family_name" placeholder="Last name">
+              <button type="submit">Set profile name</button>
+            </form>
+            <form id="pin-form" class="inline">
+              <input name="pin" type="password" placeholder="New Signal PIN" minlength="4" required autocomplete="new-password">
+              <button type="submit">Set PIN</button>
+            </form>
+          </section>
+          <section>
+            <h3>Linked devices</h3>
+            <ul id="devices" class="devices"></ul>
+            <details>
+              <summary>Link a new device</summary>
+              <p class="hint">On the device, choose to link to an existing account so it shows a QR code. Then
+                scan it with your camera, upload a screenshot of it, or paste its <code>sgnl://linkdevice</code> link.</p>
+              <div class="link-options">
+                <button type="button" data-action="scan-camera">Scan with camera</button>
+                <label class="button">Upload QR image<input type="file" accept="image/*" id="qr-file" hidden></label>
+              </div>
+              <video id="qr-video" playsinline muted hidden></video>
+              <form id="link-form" class="inline">
+                <input name="uri" placeholder="sgnl://linkdevice?uuid=…&amp;pub_key=…" required>
+                <button type="submit">Link</button>
+              </form>
+            </details>
+          </section>
+          <section>
+            <h3>Import history from a backup</h3>
+            <p class="hint">Choose the <code>SignalBackups</code> folder from your phone's on-device backup
+              (Settings › Chats › Backups on iPhone or Android), and enter its 64-character recovery key. Messages
+              already here are not duplicated, so importing again later is safe.</p>
+            <div class="link-options">
+              <label class="button">Choose backup folder<input type="file" id="import-folder" webkitdirectory hidden></label>
+            </div>
+            <form id="import-form" hidden>
+              <p data-field="import-selection"></p>
+              <label>Recovery key
+                <input name="passphrase" autocomplete="off" required></label>
+              <button type="submit">Upload and import</button>
+            </form>
+            <div id="import-status"></div>
+          </section>
+          <section>
+            <h3>Move history to a phone</h3>
+            <p class="hint">Creates an on-device backup (a <code>SignalBackups</code> folder, zipped) that a phone can
+              restore during Signal's setup, using this account's recovery key. <strong>Restoring it moves the account
+              back to that phone:</strong> the phone becomes the primary device and this server is signed out.
+              Group update notices and messages disappearing within a day aren't included.</p>
+            <button type="button" data-action="export">Create backup</button>
+            <div id="export-status"></div>
+          </section>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-new-chat">
+    <div class="modal-backdrop">
+      <div class="modal">
+        <header class="bar"><strong class="title">New chat</strong>
+          <button class="icon" data-action="close" aria-label="Close">✕</button></header>
+        <div class="modal-body">
+          <form id="new-chat-form" class="inline">
+            <input name="number" type="tel" placeholder="+15551234567" required>
+            <button type="submit">Start</button>
+          </form>
+          <input type="search" id="contact-filter" placeholder="Filter contacts">
+          <ul class="contacts" id="contacts"></ul>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <script src="/static/app.js" type="module"></script>
+</body>
+</html>

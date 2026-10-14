@@ -1,0 +1,24 @@
+[app]
+name = "bottled-signal-client"
+version = "0.1.0"
+description = "A Signal messenger client: signal-cli as the primary device, with a web chat UI and backup import"
+
+[runtime.container]
+image = "Dockerfile"
+port = 8080
+
+[routing]
+health_check = "/health"
+
+[resources]
+# signal-cli's native binary maps ~250MB of (reclaimable) file-backed pages on top of its heap; backup imports
+# decrypt and decompress in a streaming fashion but still need headroom.
+memory_mb = 1024
+cpu_cores = 1
+
+[data]
+sqlite = ["main"]
+# signal-cli's keys and state, plus message attachment files. Backed up.
+app_data = true
+# Backup uploads in flight and outgoing attachments being sent. Not backed up.
+app_temp_data = true
