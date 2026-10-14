@@ -51,7 +51,9 @@ def _hkdf(ikm: bytes, info: bytes, length: int) -> bytes:
 
 
 def normalize_recovery_key(text: str) -> str:
-    key = "".join(text.split()).replace("-", "").lower()
+    """Accept the key as either app shows it. iOS displays it uppercase with "0" as "=" and "O" as "#" so they can't be
+    confused (Signal-iOS DisplayableAccountEntropyPool); the key itself is lowercase letters and digits."""
+    key = "".join(text.split()).replace("-", "").replace("=", "0").replace("#", "o").lower()
     if len(key) != 64 or not key.isalnum():
         raise WrongRecoveryKey("the recovery key should be 64 letters and digits")
     return key

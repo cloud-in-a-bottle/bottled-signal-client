@@ -52,6 +52,10 @@ def test_recovery_key_normalization() -> None:
     assert crypto.normalize_recovery_key(spaced) == RECOVERY_KEY
     with pytest.raises(crypto.BackupDecryptError):
         crypto.normalize_recovery_key("too short")
+    # iOS shows "0" as "=" and "O" as "#" (vectors from Signal-iOS DisplayableAccountEntropyPoolTest).
+    raw = "0o0ooaa" + "a" * 57
+    assert crypto.normalize_recovery_key("=#=##AA" + "A" * 57) == raw
+    assert crypto.normalize_recovery_key("=#0oOaA" + "a" * 57) == raw
 
 
 def _frame(**kwargs: object) -> pb.Frame:
