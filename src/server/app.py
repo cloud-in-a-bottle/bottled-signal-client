@@ -99,7 +99,7 @@ async def lifespan(_: Litestar) -> AsyncIterator[None]:
     stream = EventStream(daemon.base_url, receiver.handle)
 
     signal = SignalService(conn, rpc, stream, files, broker, config.signal_config_dir, config.signal_cli_bin)
-    imports = ImportManager(config.uploads_dir, conn, files, broker)
+    imports = ImportManager(config.uploads_dir, conn, files, config.attachments_dir, broker)
     exports = ExportManager(config.temp_dir, config.db_path, files, broker)
     _context = AppContext(
         config=config, conn=conn, files=files, broker=broker, signal=signal, imports=imports, exports=exports

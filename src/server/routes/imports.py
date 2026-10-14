@@ -9,6 +9,7 @@ from litestar.datastructures import State
 
 from server.context import AppContext
 from server.imports.manager import ImportStatus
+from server.imports.manager import UploadSession
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -16,12 +17,21 @@ class StartImportRequest:
     passphrase: str
 
 
+@attr.s(auto_attribs=True, frozen=True)
+class CreateImportRequest:
+    total_bytes: int
+
+
 class ImportsController(Controller):
     path = "/api/imports"
 
     @post("/")
-    async def create(self, ctx: AppContext) -> ImportStatus:
-        return ctx.imports.create()
+    async def create(self, ctx: AppContext, data: CreateImportRequest) -> ImportStatus:
+        return ctx.imports.create(data.total_bytes)
+
+    @get("/resumable")
+    async def resumable(self, ctx: AppContext) -> list[UploadSession]:
+        return ctx.imports.resumable()
 
     @get("/{import_id:str}")
     async def status(self, ctx: AppContext, import_id: str) -> ImportStatus:

@@ -59,36 +59,70 @@ export function openImportFlow(root, api) {
     const button = form.querySelector("button");
     button.disabled = true;
     try {
-      const session = await api("POST", "/api/imports/");
-      activeId = session.id;
       const total = selected.reduce((n, x) => n + x.file.size, 0);
-      let sent = 0;
+      // Pick up an interrupted upload of the same folder: one whose files are all part of this selection and no
+      // larger than the local copies.
+      const sizes = new Map(selected.map((x) => [x.path, x.file.size]));
+      const previous = (await api("GET", "/api/imports/resumable")).find((s) => {
+        const got = Object.entries(s.received);
+        return got.length > 0 && got.every(([path, size]) => sizes.has(path) && size <= sizes.get(path));
+      });
+      const received = previous ? previous.received : {};
+      const session = previous || await api("POST", "/api/imports/", { total_bytes: total });
+      activeId = session.id;
+      let sent = selected.reduce((n, x) => n + Math.min(received[x.path] || 0, x.file.size), 0);
+      const label = previous ? "Resuming upload" : "Uploading";
       for (const { file, path } of selected) {
-        for (let offset = 0; offset < file.size || (offset === 0 && file.size === 0); offset += CHUNK) {
+        const done = received[path] || 0;
+        if (done >= file.size && file.size > 0) continue;
+        // Resume from the last whole chunk boundary; the server overwrites a partly-written chunk.
+        for (let offset = done - (done % CHUNK); offset < file.size || (offset === 0 && file.size === 0); offset += CHUNK) {
           const chunk = file.slice(offset, offset + CHUNK);
-          const url = `/api/imports/${session.id}/chunk?path=${encodeURIComponent(path)}&offset=${offset}`;
-          let attempt = 0;
-          for (;;) {
-            try {
-              const res = await fetch(url, { method: "PUT", body: chunk });
-              if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
-              break;
-            } catch (err) {
-              if (++attempt >= 5) throw err;
-              await new Promise((r) => setTimeout(r, 1000 * attempt));
-            }
-          }
-          sent += chunk.size;
-          showStatus({ state: "uploading", message: `Uploading ${formatSize(sent)} of ${formatSize(total)}`, progress: total ? sent / total : 1 });
+          await putChunk(`/api/imports/${session.id}/chunk?path=${encodeURIComponent(path)}&offset=${offset}`, chunk);
+          sent += Math.max(0, offset + chunk.size - Math.max(offset, done));
+          showStatus({ state: "uploading", message: `${label}: ${formatSize(sent)} of ${formatSize(total)}`, progress: total ? sent / total : 1 });
           if (file.size === 0) break;
         }
       }
       showStatus(await api("POST", `/api/imports/${session.id}/start`, { passphrase }));
       form.hidden = true;
     } catch (err) {
-      showStatus({ state: "failed", message: err.message, progress: 0 });
+      showStatus({
+        state: "failed",
+        message: `${err.message}. Choose the same folder and press Upload again to resume where it stopped.`,
+        progress: 0,
+      });
     } finally {
       button.disabled = false;
     }
   });
+}
+
+// Upload one chunk, giving up on a stalled request after CHUNK_TIMEOUT_MS and retrying with backoff for a few
+// minutes, so a dropped connection or a laptop waking from sleep doesn't hang or kill the upload.
+const CHUNK_TIMEOUT_MS = 120_000;
+const RETRY_DELAYS_MS = [1000, 2000, 5000, 10_000, 20_000, 30_000, 30_000, 30_000, 30_000, 30_000];
+
+async function putChunk(url, chunk) {
+  for (let attempt = 0; ; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CHUNK_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { method: "PUT", body: chunk, signal: controller.signal });
+      if (res.ok) return;
+      const text = await res.text();
+      let detail = text;
+      try { detail = JSON.parse(text).detail || text; } catch {}
+      // A rejected chunk (4xx) won't succeed on retry; anything else might.
+      if (res.status >= 400 && res.status < 500) throw Object.assign(new Error(detail), { permanent: true });
+      throw new Error(`server error ${res.status}`);
+    } catch (err) {
+      if (err.permanent || attempt >= RETRY_DELAYS_MS.length) {
+        throw err.name === "AbortError" ? new Error("the upload stalled") : err;
+      }
+      await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 }
