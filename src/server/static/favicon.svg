@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- A bottle (neck, cork, rounded body) holding a speech bubble. Shapes are kept chunky to read at 16px. -->
+  <rect x="25" y="2" width="14" height="7" rx="2" fill="#a86b32"/>
+  <path d="M23 9h18v8c0 2 2 3 5 4.5C52 24 56 28 56 35v19a8 8 0 0 1-8 8H16a8 8 0 0 1-8-8V35c0-7 4-11 10-13.5 3-1.5 5-2.5 5-4.5z" fill="#2c6bed"/>
+  <path d="M19 31h26a5 5 0 0 1 5 5v10a5 5 0 0 1-5 5H31l-8 6v-6h-4a5 5 0 0 1-5-5V36a5 5 0 0 1 5-5z" fill="#ffffff"/>
+  <circle cx="24" cy="41" r="2.6" fill="#2c6bed"/>
+  <circle cx="32" cy="41" r="2.6" fill="#2c6bed"/>
+  <circle cx="40" cy="41" r="2.6" fill="#2c6bed"/>
+</svg>
