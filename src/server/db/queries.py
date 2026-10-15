@@ -2,6 +2,8 @@ import sqlite3
 
 import attr
 
+from server.db.messages import COUNTS_AS_ACTIVITY_SQL
+
 _DISPLAY_NAME_SQL = (
     "coalesce(nullif({r}.contact_name, ''), nullif({r}.profile_name, ''), nullif({r}.group_title, ''), {r}.e164, "
     "CASE {r}.kind WHEN 'group' THEN 'Unnamed group' ELSE 'Unknown' END)"
@@ -115,7 +117,8 @@ def _summary_select(where: str) -> str:
                (SELECT CASE WHEN m.deleted_at IS NOT NULL THEN 'This message was deleted'
                             WHEN m.kind = 'update' THEN '(update)'
                             ELSE coalesce(m.body, '(attachment)') END
-                  FROM messages m WHERE m.conversation_id = c.id ORDER BY m.sent_at DESC LIMIT 1) AS preview,
+                  FROM messages m WHERE m.conversation_id = c.id AND {COUNTS_AS_ACTIVITY_SQL}
+                  ORDER BY m.sent_at DESC LIMIT 1) AS preview,
                (SELECT count(*) FROM messages m WHERE m.conversation_id = c.id AND m.sent_at > c.last_read_at
                   AND m.author_id != (SELECT id FROM recipients WHERE kind = 'self') AND m.kind = 'text') AS unread
         FROM conversations c JOIN recipients r ON r.id = c.recipient_id

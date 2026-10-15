@@ -24,6 +24,7 @@ from server.context import AppContext
 from server.db.connection import connect
 from server.db.connection import init_schema
 from server.db.files import FileStore
+from server.db.messages import recompute_last_activity
 from server.events import EventBroker
 from server.exports.manager import ExportManager
 from server.imports.manager import ImportManager
@@ -104,6 +105,7 @@ async def lifespan(_: Litestar) -> AsyncIterator[None]:
     config = _config
     conn = connect(config.db_path)
     init_schema(conn)
+    recompute_last_activity(conn)
     files = FileStore(config.attachments_dir)
     broker = EventBroker()
     daemon = SignalDaemon(config.signal_cli_bin, config.signal_config_dir)

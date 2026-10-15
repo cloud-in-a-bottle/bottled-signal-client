@@ -1,6 +1,37 @@
+import json
 import sqlite3
 
 import attr
+
+# Informational notices that Signal shows in a chat but that don't count as activity: they neither move the chat up the
+# list nor become its preview. Matched on the `type` of a message's update_payload.
+QUIET_UPDATE_TYPES = ("safetyNumberChange", "profileChange", "chatSessionRefresh")
+
+# SQL condition (on messages aliased `m`) for messages that count as chat activity.
+COUNTS_AS_ACTIVITY_SQL = (
+    "NOT (m.kind = 'update' AND coalesce(json_extract(m.update_payload, '$.type'), '') IN ("
+    + ", ".join(f"'{t}'" for t in QUIET_UPDATE_TYPES)
+    + "))"
+)
+
+
+def is_quiet_update(kind: str, update_payload: str | None) -> bool:
+    return (
+        kind == "update"
+        and update_payload is not None
+        and json.loads(update_payload).get("type") in QUIET_UPDATE_TYPES
+    )
+
+
+def recompute_last_activity(conn: sqlite3.Connection) -> None:
+    """Re-derive each chat's ordering timestamp from its messages, eg after changing what counts as activity."""
+    conn.execute(
+        f"""
+        UPDATE conversations SET last_message_at = coalesce(
+            (SELECT max(m.sent_at) FROM messages m WHERE m.conversation_id = conversations.id AND {COUNTS_AS_ACTIVITY_SQL}),
+            0)
+        """
+    )
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -122,10 +153,11 @@ def insert_message(conn: sqlite3.Connection, msg: NewMessage) -> StoredMessage:
                 att.status,
             ),
         )
-    conn.execute(
-        "UPDATE conversations SET last_message_at = max(last_message_at, ?) WHERE id = ?",
-        (msg.sent_at, conversation_id),
-    )
+    if not is_quiet_update(msg.kind, msg.update_payload):
+        conn.execute(
+            "UPDATE conversations SET last_message_at = max(last_message_at, ?) WHERE id = ?",
+            (msg.sent_at, conversation_id),
+        )
     return StoredMessage(id=message_id, conversation_id=conversation_id, created=True)
 
 
