@@ -1,7 +1,7 @@
 [app]
 name = "bottled-signal-client"
-version = "0.1.0"
-description = "A Signal messenger client: signal-cli as the primary device, with a web chat UI and backup import"
+version = "0.2.0"
+description = "A Signal messenger client: signal-cli as the primary device, with a web chat UI, backup import and export"
 
 [runtime.container]
 image = "Dockerfile"
@@ -11,17 +11,24 @@ port = 8080
 health_check = "/health"
 
 [resources]
-# Measured under a 320MB limit: ~50MB anonymous memory idle and while importing/exporting an 80MB backup (both
-# stream), plus ~175MB of signal-cli's mapped native binary that should stay resident. The rest is headroom for a
-# live account, which hasn't been measured yet.
+# The Python version measured ~50MB idle and while importing or exporting an 80MB backup, plus ~175MB of signal-cli's
+# mapped native binary that should stay resident; the Go server and bridge add about as much. The rest is headroom.
 memory_mb = 512
-# A clean image build fits in 512MB; give it room anyway.
-build_memory_mb = 1024
+# Compiling mautrix and cgo sqlite needs more than the app does at runtime.
+build_memory_mb = 2048
 cpu_cores = 1
 
 [data]
-sqlite = ["main"]
-# signal-cli's keys and state, plus message attachment files. Backed up.
+# main: the message store (conversations, messages, reactions, ...), the only copy of the history. bridge: the
+# bridge's own bookkeeping (ID mappings, which messages disappear when).
+sqlite = ["main", "bridge"]
+# signal-cli's keys and state (losing them means registering again), and attachment files. Backed up.
 app_data = true
-# Backup uploads in flight and outgoing attachments being sent. Not backed up.
+# Backup uploads being imported, exports being downloaded, and files being sent. Not backed up.
 app_temp_data = true
+
+# Other apps read and send messages through this one with the messaging service.
+[[services.v2.provides]]
+service = "github.com/cloud-in-a-bottle/messaging-service-spec"
+version = "0.1.0"
+endpoint = "/messaging/"
