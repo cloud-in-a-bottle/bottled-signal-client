@@ -558,7 +558,8 @@ function renderAttachment(a) {
     return el("div", { class: "missing" }, `${label}${a.filename ? ` (${a.filename})` : ""}`);
   }
   let media;
-  if (type.startsWith("image/")) {
+  // SVG can carry script, so the server only offers it as a download.
+  if (type.startsWith("image/") && !type.startsWith("image/svg")) {
     media = el("a", { href: url, target: "_blank", rel: "noopener" },
       el("img", { src: url, loading: "lazy", alt: a.filename || "image", width: a.width, height: a.height }));
   } else if (type.startsWith("video/")) {

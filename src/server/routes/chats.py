@@ -19,6 +19,8 @@ from server.context import AppContext
 from server.db import queries
 from server.db.messages import conversation_for
 from server.db.tx import transaction
+from server.routes.attachment_headers import SECURITY_HEADERS
+from server.routes.attachment_headers import attachment_delivery
 from server.signal.service import OutgoingAttachment
 
 
@@ -151,11 +153,13 @@ class ChatsController(Controller):
         if found is None:
             raise NotFoundException()
         sha, content_type, filename = found
+        delivery = attachment_delivery(content_type)
         return File(
             path=ctx.files.path_for(sha),
             filename=filename or sha,
-            media_type=content_type or "application/octet-stream",
-            content_disposition_type="inline",
+            media_type=delivery.media_type,
+            content_disposition_type=delivery.disposition,
+            headers=SECURITY_HEADERS,
         )
 
     @get("/search")
