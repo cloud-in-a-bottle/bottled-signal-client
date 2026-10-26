@@ -1,2 +1,0 @@
-tus.min.js: tus-js-client 4.3.1 (MIT), https://github.com/tus/tus-js-client, from
-https://cdn.jsdelivr.net/npm/tus-js-client@4.3.1/dist/tus.min.js. Served locally so the app makes no third-party requests.
